@@ -1,7 +1,9 @@
 import math
 import time
 import random
+import json
 import cv2
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 from app.services.input import InputService
 from app.services.vision import VisionService
@@ -15,6 +17,30 @@ _EDRAG_COUNT = 12
 _EDRAG_DELAY = 0.2
 _EDRAG_CORNER_MARGIN = 100
 _DIAMOND_EDGES = (('left', 'top'), ('top', 'right'))
+# Per-hero random wait between deploy and its first ability click, so abilities
+# don't fire back-to-back with the deploy taps.
+_HERO_ABILITY_DELAY_MIN = 5
+_HERO_ABILITY_DELAY_MAX = 8
+_DEPLOY_ZONES_FILE = Path(__file__).parent.parent.parent / 'deploy_zones.json'
+_DEPLOY_ZONES_CACHE = None
+
+def _load_deploy_zones():
+    '''Load custom deployment zone sets from deploy_zones.json if present.
+Returns a list of sets (each set is a list of [ref_x, ref_y] pairs), or None
+if the file doesn't exist — in which case the original drag deploy runs instead.'''
+    global _DEPLOY_ZONES_CACHE
+    if _DEPLOY_ZONES_CACHE is not None:
+        return _DEPLOY_ZONES_CACHE
+    if not _DEPLOY_ZONES_FILE.exists():
+        return None
+    try:
+        data = json.loads(_DEPLOY_ZONES_FILE.read_text())
+        _DEPLOY_ZONES_CACHE = data.get('sets')
+        logger.info('Loaded %d custom deploy zone sets from %s', len(_DEPLOY_ZONES_CACHE), _DEPLOY_ZONES_FILE.name)
+        return _DEPLOY_ZONES_CACHE
+    except Exception as e:
+        logger.warning('Failed to load deploy_zones.json: %s — falling back to default deploy', e)
+        return None
 
 class AttackStrategy:
     '''Base class for attack strategies.'''
@@ -122,14 +148,26 @@ class AttackStrategy:
             tile = None
             if live is not None and bx >= radius and by >= radius:
                 tile = live[by-radius:by+radius, bx-radius:bx+radius].copy()
-            deployed_heroes.append((bx, by, tile))
+            # Ability delay: don't click this hero's ability until 5-8s (randomized
+            # per hero) after it lands.
+            ability_ready_at = time.time() + random.uniform(_HERO_ABILITY_DELAY_MIN, _HERO_ABILITY_DELAY_MAX)
+            deployed_heroes.append((bx, by, tile, ability_ready_at))
         while deployed_heroes:
             fresh, interrupted = self._reward_checkpoint()
             if interrupted:
                 deployed_heroes = self._relocate_abilities(deployed_heroes, fresh)
             if not deployed_heroes:
                 break
-            hx, hy, _ = deployed_heroes.pop(0)
+            hx, hy, _, ability_ready_at = deployed_heroes.pop(0)
+            wait_s = ability_ready_at - time.time()
+            while wait_s > 0:
+                chunk = min(wait_s, 0.5)
+                if self.stop_event:
+                    if self.stop_event.wait(chunk):
+                        return
+                else:
+                    time.sleep(chunk)
+                wait_s -= chunk
             self.input.click(hx, hy, pause = 0.2)
             logger.info('Hero ability clicked at %d,%d', hx, hy)
             if self.stop_event:
@@ -144,13 +182,13 @@ class AttackStrategy:
         top = frame.shape[0]//2
         roi = cv2.cvtColor(frame[top:], cv2.COLOR_BGR2GRAY)
         relocated = []
-        for x, y, tile in heroes:
+        for x, y, tile, ability_ready_at in heroes:
             if tile is None or not tile.size:
                 continue
             gray = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
             _, score, _, loc = cv2.minMaxLoc(cv2.matchTemplate(roi, gray, cv2.TM_CCOEFF_NORMED))
             if score >= .65:
-                relocated.append((loc[0]+tile.shape[1]//2, top+loc[1]+tile.shape[0]//2, tile))
+                relocated.append((loc[0]+tile.shape[1]//2, top+loc[1]+tile.shape[0]//2, tile, ability_ready_at))
             else:
                 logger.info('Hero no longer recognizable after reward; skipping stale slot')
         return relocated
@@ -501,42 +539,84 @@ slot nearest the top vertex is left empty (virtual troop at the apex).
         return True
 
     
+    def _edrag_inward_spell_points(self, frame, n=5):
+        '''Return n points spread evenly along the L→T→R arc Edrags actually travel.
+Spells are spaced across both diamond edges so rage covers the full Edrag path.'''
+        data = self._scaled_deployment_data()
+        (fh, fw) = frame.shape[:2]
+        (lx, ly) = data['left']
+        (tx, ty) = data['top']
+        (rx, ry) = data['right']
+        # Build the full L→T→R waypoint path and space n points evenly along it.
+        # Nudge all three corners inward toward screen center before spacing spells.
+        cx, cy = fw / 2, fh / 2
+        inward = 0.67  # 0=on the diamond edge, 1=screen center
+        lx = lx + (cx - lx) * inward
+        ly = ly + (cy - ly) * inward
+        tx = tx + (cx - tx) * inward
+        ty = ty + (cy - ty) * inward
+        rx = rx + (cx - rx) * inward
+        ry = ry + (cy - ry) * inward
+        path = [(lx, ly), (tx, ty), (rx, ry)]
+        seg_lens = [
+            math.hypot(path[1][0]-path[0][0], path[1][1]-path[0][1]),
+            math.hypot(path[2][0]-path[1][0], path[2][1]-path[1][1]),
+        ]
+        total = sum(seg_lens)
+        points = []
+        for i in range(n):
+            t = (i + 0.5) / n * total  # evenly spaced, avoid exact corners
+            if t <= seg_lens[0]:
+                frac = t / seg_lens[0]
+                px = path[0][0] + (path[1][0]-path[0][0]) * frac
+                py = path[0][1] + (path[1][1]-path[0][1]) * frac
+            else:
+                frac = (t - seg_lens[0]) / seg_lens[1]
+                px = path[1][0] + (path[2][0]-path[1][0]) * frac
+                py = path[1][1] + (path[2][1]-path[1][1]) * frac
+            px = max(0, min(fw-1, int(px) + random.randint(-20, 20)))
+            py = max(0, min(fh-1, int(py) + random.randint(-20, 20)))
+            points.append((px, py))
+        return points
+
     def deploy_spells(self, frame):
         frame, _ = self._reward_checkpoint(frame)
         self._sync_frame_size(frame)
         roi = self.vision.bottom_half_region(frame)
         (bx, by) = self.vision.find_template(frame, 'earthquake.png', region = roi)
-        if bx:  # [recovered: decompiler turned `if` into `while`, causing endless earthquake spam after spells ran out]
-            self.input.click(bx, by, pause = 0.2)
-            offset = int(self.config.get_scaled('earthquake', 400))
-            ltr = self._earthquake_anchor_triplet(self._scaled_deployment_data(), offset)
-            (fh, fw) = frame.shape[:2]
-            (num, den) = _EARTHQUAKE_RANDOM_LINE_FROM_BOTTOM
-            y_line = self._earthquake_horizontal_y(fh, num, den)
-            if self.earthquake_method == EARTHQUAKE_METHOD_RANDOM:
-                arc_dense = self._sample_arc_through_three(ltr, _EARTHQUAKE_REGION_ARC_SAMPLES)
-                if random.choice((True, False)):
-                    arc_dense = arc_dense[::-1]
-                poly = self._earthquake_fill_polygon(arc_dense, y_line)
-                if abs(self._polygon_double_area(poly)) < 2:
-                    logger.warning('Earthquake random region degenerate; using curve placement with jitter.')
-                    points = self._earthquake_curve_points_with_jitter(ltr)
-                else:
-                    points = self._random_points_in_polygon(poly, fw, fh, 11)
+        if not bx:
+            return None
+        self.input.click(bx, by, pause = 0.2)
+        # Wait 5s after hero abilities have fired before placing spells.
+        pre_delay = 5.0
+        if self.stop_event:
+            self.stop_event.wait(pre_delay)
+        else:
+            time.sleep(pre_delay)
+        # Re-select the spell — it auto-deselects during the wait.
+        fresh_frame = self.input.window_service.screenshot()
+        if fresh_frame is not None:
+            frame = fresh_frame
+        self._sync_frame_size(frame)
+        roi = self.vision.bottom_half_region(frame)
+        (bx2, by2) = self.vision.find_template(frame, 'earthquake.png', region=roi)
+        if not bx2:
+            logger.warning('Spell deploy: rage icon gone after wait — skipping placement')
+            return None
+        self.input.click(bx2, by2, pause=0.3, rand=False)
+        (fh, fw) = frame.shape[:2]
+        points = self._edrag_inward_spell_points(frame, n=5)
+        logger.info('Edrag spell deploy: placing 5 rage spells along inward funnel path')
+        for (px, py) in points:
+            fresh, handled = self._reward_checkpoint(selected='earthquake.png')
+            if handled and fresh is None:
+                break
+            self.input.click_at(px, py, rand=False)
+            delay = random.uniform(1.0, 2.0)
+            if self.stop_event:
+                self.stop_event.wait(delay)
             else:
-                points = self._earthquake_curve_points_with_jitter(ltr)
-            for cx, cy in points:
-                fresh, handled = self._reward_checkpoint(selected='earthquake.png')
-                if handled and fresh is None:
-                    break
-                jx = max(0, min(fw - 1, cx))
-                jy = max(0, min(fh - 1, cy))
-                self.input.click_at(jx, jy, rand = False)
-                delay = random.uniform(0.1, 0.3)
-                if self.stop_event:
-                    self.stop_event.wait(delay)
-                else:  # [recovered: decompiler dropped the else — both waits ran, doubling every spell delay]
-                    time.sleep(delay)
+                time.sleep(delay)
         return None
 
 
@@ -568,6 +648,7 @@ class TroopSpamStrategy(AttackStrategy):
         self.input.click(tx, ty, pause = 0.3, rand = False)
         if ev and ev.wait(0.2):
             return True
+
         corners = [
             'top',
             'right',
@@ -595,7 +676,6 @@ class TroopSpamStrategy(AttackStrategy):
         if ev and ev.wait(0.65):
             self.input.mouse_up(curr_x, curr_y)
             return True
-        
         try:
             total_duration = self.duration
             segment_duration = total_duration / 4

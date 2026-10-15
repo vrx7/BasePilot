@@ -26,14 +26,22 @@ _BB_RETURN_HOME_TEMPLATE_1080P = 'breturnhome1920.png'
 _BB_1080P_CAPTURE_SIZE = (1920, 1080)
 _BB_1080P_SIZE_TOLERANCE = 40
 _BB_TEMPLATE_SUPPRESS_PAD = 0.1
+_BB_COPTER_ABILITY_INTERVAL = 20
+_BB_ELIXIR_CART_COLLECT_EVERY = 10
 _BB_FULL_ELIXIR_CART_TEMPLATES = ('fullecart.png', 'fullecart2.png', 'fullecart3.png')
 _BB_COLLECT_TEMPLATE = 'collect.png'
 _BB_STAR_BONUS_TEMPLATE = 'bstar.png'
 _BB_BATTLE_STAR_TEMPLATE = 'bbstar.png'
 _BB_BATTLE_MACHINE_TEMPLATE = 'battlemachine.png'
 _BB_FLYING_MACHINE_TEMPLATE = 'flyingmachine.png'
-_BB_GOLD_PRIORITISE_MIN_STARS = 2
+_BB_GOLD_PRIORITISE_MIN_STARS = 3
 _BB_RETURN_HOME_END_BATTLE_RETRIES = 5
+# False = hands-off in the HOME VILLAGE ONLY: the bot never taps End Battle / Surrender there.
+# It deploys, then waits for that battle to finish (timer, 100%, or you ending it by hand) before
+# returning home. Builder Base is untouched. This also fully skips the 1-star post-battle delay
+# below, since there's nothing left for it to time -- the bot isn't the one ending the battle.
+_AUTO_END_BATTLE = False
+_MANUAL_BATTLE_WAIT_SECONDS = 420
 _STAR_BONUS_THRESHOLD = 0.75
 _TROOP_FAILURE_LIMIT = 4
 _TROOP_RETRY_WAIT_SECONDS = 15  # training is instant since the Mar 2025 "Clash Anytime" update — this only lets the UI settle
@@ -934,6 +942,7 @@ deselect, which would eat the upcoming Attack click.'''
             if cb:
                 cb(msg)
             return None
+        battle_count = 0
         while time.time() - start_time < duration_seconds:
             self._check_stop()
             self.input.scroll(*self._scroll_point(), 20)
@@ -982,7 +991,10 @@ deselect, which would eat the upcoming Attack click.'''
                 self._bb_gold_prioritise_end_battle_and_return_home()
             else:
                 self._bb_end_battle_and_return_home()
-            self._bb_collect_elixir_cart_after_attack()
+            battle_count += 1
+            if battle_count % _BB_ELIXIR_CART_COLLECT_EVERY == 0:
+                logger.info('Builder Base: battle %d — collecting elixir cart', battle_count)
+                self._bb_collect_elixir_cart_after_attack()
             if star_bonus and self._is_bb_star_bonus_finished():
                 logger.info('Builder Base star bonus finished (bstar.png no longer visible). Stopping.')
                 return None
@@ -1101,20 +1113,12 @@ deselect, which would eat the upcoming Attack click.'''
 
     
     def _bb_end_battle_and_return_home(self):
-        '''Wait for natural battle end, dismiss Okay, then tap BB Return Home.'''
-        (ex, ey) = self._wait_for_image('endbattle.png', timeout = 90, error = False)
-        if ex:
-            self.input.click(ex, ey, pause = 0.15)
-        else:
-            logger.warning('Builder Base: endbattle.png not found')
-            return None
-        self._bb_dismiss_okay_and_return_home()
-
-    
-    def _bb_gold_prioritise_end_battle_and_return_home(self):
-        '''Gold prioritise: wait for 2+ battle stars, then End Battle → Okay → Return Home.'''
+        '''Wait for natural battle end, dismiss Okay, then tap BB Return Home.
+Polls (rather than a single blocking wait) so the Flying/Battle Machine ability
+can be re-triggered every _BB_COPTER_ABILITY_INTERVAL seconds while waiting.'''
         start = time.time()
         timeout = 90
+        copter_last_click = 0
         end_battle_clicked = False
         while time.time() - start < timeout:
             self._check_stop()
@@ -1124,22 +1128,130 @@ deselect, which would eat the upcoming Attack click.'''
                     return None
                 continue
             self._update_config_size(frame)
+            copter_last_click = self._bb_maybe_use_copter_ability(frame, copter_last_click)
             bot_roi = VisionService.bottom_half_region(frame)
-            stars = VisionService.find_all_template_centers(frame, _BB_BATTLE_STAR_TEMPLATE, threshold = 0.8, region = bot_roi, max_matches = 3, suppress_pad_frac = 0.35)
-            if len(stars) >= _BB_GOLD_PRIORITISE_MIN_STARS:
-                bot_roi = VisionService.bottom_half_region(frame)
-                (ex, ey) = self.vision.find_template(frame, 'endbattle.png', region = bot_roi)
-                if ex:
-                    logger.info('Builder Base (gold): %d bbstar.png — clicking endbattle', len(stars))
-                    self.input.click(ex, ey, pause = 0.15)
-                    end_battle_clicked = True
-                    break  # [recovered: decompiler dropped this break and misnested the timeout warning inside the loop]
+            (ex, ey) = self.vision.find_template(frame, 'endbattle.png', region = bot_roi)
+            if ex:
+                self.input.click(ex, ey, pause = 0.15)
+                end_battle_clicked = True
+                break
             if self.stop_event.wait(0.5):
                 return None
         if not end_battle_clicked:
-            logger.warning('Builder Base (gold): timed out waiting for %d+ %s', _BB_GOLD_PRIORITISE_MIN_STARS, _BB_BATTLE_STAR_TEMPLATE)
+            logger.warning('Builder Base: endbattle.png not found')
             return None
         self._bb_dismiss_okay_and_return_home()
+
+    
+    def _bb_maybe_use_copter_ability(self, frame, last_click_ts):
+        '''Click the deployed Flying Machine / Battle Machine's icon every
+_BB_COPTER_ABILITY_INTERVAL seconds, so it keeps re-using its ability throughout the battle.'''
+        now = time.time()
+        if now - last_click_ts < _BB_COPTER_ABILITY_INTERVAL:
+            return last_click_ts
+        roi = VisionService.bottom_half_region(frame)
+        (cx, cy) = self.vision.find_template(frame, _BB_FLYING_MACHINE_TEMPLATE, region = roi)
+        if not cx:
+            (cx, cy) = self.vision.find_template(frame, _BB_BATTLE_MACHINE_TEMPLATE, region = roi)
+        if cx:
+            self.input.click(cx, cy, pause = 0.15, rand = False)
+            logger.info('Builder Base: Flying/Battle Machine ability clicked')
+            return now
+        return last_click_ts
+
+    def _bb_wait_for_natural_end_and_return_home(self):
+        '''Let the battle end on its own (timer runs out) instead of tapping End Battle.
+Some setups show an Okay/loot-summary screen first, others go straight to breturnhome.png
+— watch for whichever one actually shows up, one screenshot per pass. Also keeps the
+Flying/Battle Machine ability firing every _BB_COPTER_ABILITY_INTERVAL seconds while it waits.'''
+        start = time.time()
+        copter_last_click = 0
+        while time.time() - start < _MANUAL_BATTLE_WAIT_SECONDS:
+            self._check_stop()
+            frame = self.window.screenshot()
+            if frame is None:
+                if self.stop_event.wait(0.5):
+                    return None
+                continue
+            self._update_config_size(frame)
+            copter_last_click = self._bb_maybe_use_copter_ability(frame, copter_last_click)
+            (ox, oy) = self.vision.find_template(frame, 'okay.png')
+            if ox:
+                self.input.click(ox, oy, pause = 0.15)
+                break
+            (h, w) = frame.shape[:2]
+            (rh_template, scale_template) = self._bb_return_home_template_for_screen(w, h)
+            search_region = self._search_region_for_template(frame, rh_template, None, None, 200)
+            (rx, ry) = self.vision.find_template(frame, rh_template, threshold = 0.8, region = search_region, scale_template = scale_template)
+            if rx:
+                self.input.click(rx, ry, pause = 0.2)
+                return None
+            (cx, cy) = self.vision.find_template(frame, 'chestclaim.png')
+            if cx:
+                logger.info('Builder Base: chestclaim.png (replacing return home); running chest flow')
+                self.input.click(cx, cy, pause = 0.2)
+                if self.stop_event.wait(0.35):
+                    return None
+                self._tap_empty_until_chest_continue()
+                return None
+            if self.stop_event.wait(0.5):
+                return None
+        else:
+            logger.warning('Builder Base: neither okay.png nor breturnhome.png appeared after %ds', _MANUAL_BATTLE_WAIT_SECONDS)
+            self._bb_dismiss_okay_and_return_home(max_retries = 1)
+            return None
+        # Okay got clicked above — now wait for breturnhome.png (or a chest popup in its place).
+        (rx, ry, return_home_template) = self._wait_for_bb_return_home(timeout = 15)
+        if rx and return_home_template == 'chestclaim.png':
+            logger.info('Builder Base: chestclaim.png (replacing return home); running chest flow')
+            self.input.click(rx, ry, pause = 0.2)
+            if self.stop_event.wait(0.35):
+                return None
+            self._tap_empty_until_chest_continue()
+            return None
+        if rx:
+            self.input.click(rx, ry, pause = 0.2)
+            return None
+        logger.warning('Builder Base: breturnhome.png not found — retrying via normal dismiss flow')
+        self._bb_dismiss_okay_and_return_home(max_retries = 1)
+
+    def _bb_gold_prioritise_end_battle_and_return_home(self):
+        '''Gold prioritise: wait for _BB_GOLD_PRIORITISE_MIN_STARS battle stars, then wait 12-15s,
+redeploy everything once more, and let the battle end naturally. If the star threshold is never
+reached, skip straight to the same natural-end wait instead of hunting for endbattle.png, which
+may already be gone if the battle timer ran out while we were still polling for stars.'''
+        start = time.time()
+        timeout = 90
+        stars_hit = False
+        copter_last_click = 0
+        while time.time() - start < timeout:
+            self._check_stop()
+            frame = self.window.screenshot()
+            if frame is None:
+                if self.stop_event.wait(0.5):
+                    return None
+                continue
+            self._update_config_size(frame)
+            copter_last_click = self._bb_maybe_use_copter_ability(frame, copter_last_click)
+            bot_roi = VisionService.bottom_half_region(frame)
+            stars = VisionService.find_all_template_centers(frame, _BB_BATTLE_STAR_TEMPLATE, threshold = 0.8, region = bot_roi, max_matches = 3, suppress_pad_frac = 0.35)
+            if len(stars) >= _BB_GOLD_PRIORITISE_MIN_STARS:
+                logger.info('Builder Base (gold): %d bbstar.png — waiting 12-15s then redeploying', len(stars))
+                stars_hit = True
+                break
+            if self.stop_event.wait(0.5):
+                return None
+        if not stars_hit:
+            logger.warning('Builder Base (gold): timed out waiting for %d+ %s — waiting for breturnhome.png instead', _BB_GOLD_PRIORITISE_MIN_STARS, _BB_BATTLE_STAR_TEMPLATE)
+            return self._bb_wait_for_natural_end_and_return_home()
+        if self.stop_event.wait(random.uniform(12, 15)):
+            return None
+        frame = self.window.screenshot()
+        if frame is not None:
+            self._update_config_size(frame)
+            if not self._deploy_bb_baby_dragons(frame):
+                logger.info('Builder Base (gold): nothing left to redeploy after 3-star')
+        self._bb_wait_for_natural_end_and_return_home()
 
     
     def _bb_return_home_template_for_screen(self, width, height):
@@ -1152,7 +1264,8 @@ deselect, which would eat the upcoming Attack click.'''
 
     
     def _wait_for_bb_return_home(self, timeout = 15):
-        '''Wait for BB Return Home; picks 1080p-native template when capture is ~1920x1080.'''
+        '''Wait for BB Return Home, or a chest-reward popup (season reward / trophy milestone)
+covering it. Picks 1080p-native template when capture is ~1920x1080.'''
         start = time.time()
         template_name = _BB_RETURN_HOME_TEMPLATE
         while time.time() - start < timeout:
@@ -1167,6 +1280,9 @@ deselect, which would eat the upcoming Attack click.'''
             (x, y) = self.vision.find_template(frame, template_name, threshold = 0.8, region = search_region, scale_template = scale_template)
             if x:
                 return (x, y, template_name)
+            (cx, cy) = self.vision.find_template(frame, 'chestclaim.png')
+            if cx:
+                return (cx, cy, 'chestclaim.png')
             if self.stop_event.wait(0.5):
                 return (None, None, template_name)
         return (None, None, template_name)
@@ -1188,6 +1304,13 @@ deselect, which would eat the upcoming Attack click.'''
             if ox:
                 self.input.click(ox, oy, pause = 0.15)
             (rx, ry, return_home_template) = self._wait_for_bb_return_home(timeout = 15)
+            if rx and return_home_template == 'chestclaim.png':
+                logger.info('Builder Base: chestclaim.png (replacing return home); running chest flow')
+                self.input.click(rx, ry, pause = 0.2)
+                if self.stop_event.wait(0.35):
+                    return None
+                self._tap_empty_until_chest_continue()
+                return None
             if rx:
                 self.input.click(rx, ry, pause = 0.2)
                 if attempt > 0:
@@ -1364,7 +1487,35 @@ deselect, which would eat the upcoming Attack click.'''
         return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'sneaky', 15, status_callback = cb, earthquake_method = eq, secondary_template = secondary, secondary_count = secondary_count)
 
     
+    def _wait_for_battle_over(self, timeout = _MANUAL_BATTLE_WAIT_SECONDS):
+        '''Hands-off wait: no End Battle / Surrender taps. Returns once neither button has been on screen for ~1.5s.'''
+        start = time.time()
+        gone_since = None
+        while time.time() - start < timeout:
+            self._check_stop()
+            frame = self.window.screenshot()
+            if frame is None:
+                if self.stop_event.wait(0.5):
+                    return None
+                continue
+            self._update_config_size(frame)
+            (ex, ey) = self.vision.find_template(frame, 'endbattle.png')
+            (sx, sy) = self.vision.find_template(frame, 'surrender.png')
+            if ex or sx:
+                gone_since = None
+            elif gone_since is None:
+                gone_since = time.time()
+            elif time.time() - gone_since >= 1.5:
+                return None
+            if self.stop_event.wait(1):
+                return None
+        logger.warning('Battle still live after %ds — giving up the wait (auto-end is off)', timeout)
+
+    
     def _wait_for_battle_end(self, is_sneaky):
+        if not _AUTO_END_BATTLE:
+            self._wait_for_battle_over()
+            return None
         if is_sneaky:
             if self.stop_event.wait(3):
                 return None
